@@ -1,0 +1,125 @@
+name: Test
+
+# Signs the package in testdata/ with a certified signing key and directly,
+# and checks that signing with the primary key by mistake or with another key
+# than trusted-key fails, on Linux and macOS.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install minisign
+        run: |
+          if [[ "${RUNNER_OS}" == Linux ]]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          else
+            brew install minisign
+          fi
+
+      - id: keys
+        name: Make the keys, the certificate and the packages
+        run: |
+          set -euo pipefail
+          keys="${RUNNER_TEMP}/keys"
+          mkdir -p "${keys}/certificate"
+          minisign -G -W -p "${keys}/primary.pub" -s "${keys}/primary.key" >/dev/null
+          minisign -G -W -p "${keys}/signing.pub" -s "${keys}/signing.key" >/dev/null
+          cp "${keys}/signing.pub" "${keys}/certificate/plugin.signer"
+          minisign -S -s "${keys}/primary.key" -m "${keys}/certificate/plugin.signer" \
+            -x "${keys}/certificate/plugin.signer.minisig" -t "signer:io.github.example.release-test" >/dev/null
+          for dir in certified direct other-key mistaken; do
+            mkdir -p "${RUNNER_TEMP}/${dir}"
+            tar -czf "${RUNNER_TEMP}/${dir}/io.github.example.release-test-1.0.0.tar.gz" -C testdata/plugin plugin.json README.md webapp
+          done
+          {
+            echo "dir=${keys}"
+            echo "signing-id=$(sed -n 's/^untrusted comment: minisign public key //p' "${keys}/signing.pub")"
+            echo "signing<<KEY_EOF"; cat "${keys}/signing.key"; echo "KEY_EOF"
+            echo "primary<<KEY_EOF"; cat "${keys}/primary.key"; echo "KEY_EOF"
+            echo "primary-public<<KEY_EOF"; cat "${keys}/primary.pub"; echo "KEY_EOF"
+          } >>"${GITHUB_OUTPUT}"
+
+      - id: certified
+        uses: ./
+        with:
+          packages: ${{ runner.temp }}/certified
+          signing-key: ${{ steps.keys.outputs.signing }}
+          certificate: ${{ steps.keys.outputs.dir }}/certificate
+          trusted-key: ${{ steps.keys.outputs.primary-public }}
+
+      - name: The certified package carries the certificate and verifies
+        env:
+          SIGNER: ${{ steps.certified.outputs.signer }}
+          EXPECTED: ${{ steps.keys.outputs.signing-id }}
+          PACKAGES: ${{ steps.certified.outputs.packages }}
+        run: |
+          set -euo pipefail
+          test "${SIGNER}" = "${EXPECTED}"
+          archive="$(head -n 1 <<<"${PACKAGES}")"
+          test "$(tar -tzf "${archive}" | head -n 1)" = plugin.json
+          test -f "${archive}.sha256"
+          dir="$(mktemp -d)"
+          tar -xzf "${archive}" -C "${dir}"
+          minisign -V -q -m "${dir}/plugin.sums" -x "${dir}/plugin.sums.minisig" -p "${RUNNER_TEMP}/keys/signing.pub"
+          minisign -V -q -m "${dir}/plugin.signer" -x "${dir}/plugin.signer.minisig" -p "${RUNNER_TEMP}/keys/primary.pub"
+
+      - id: direct
+        uses: ./
+        with:
+          packages: ${{ runner.temp }}/direct
+          signing-key: ${{ steps.keys.outputs.primary }}
+          certificate: ''
+          trusted-key: ${{ steps.keys.outputs.primary-public }}
+
+      - name: The direct package carries no certificate
+        env:
+          SIGNER: ${{ steps.direct.outputs.signer }}
+        run: |
+          set -euo pipefail
+          test -z "${SIGNER}"
+          ! tar -tzf "${RUNNER_TEMP}/direct/io.github.example.release-test-1.0.0.tar.gz" | grep -q plugin.signer
+
+      - id: other-key
+        continue-on-error: true
+        uses: ./
+        with:
+          packages: ${{ runner.temp }}/other-key
+          signing-key: ${{ steps.keys.outputs.signing }}
+          certificate: ''
+          trusted-key: ${{ steps.keys.outputs.primary-public }}
+
+      - name: Signing directly with another key than trusted-key fails
+        env:
+          OUTCOME: ${{ steps.other-key.outcome }}
+        run: test "${OUTCOME}" = failure
+
+      - id: mistaken
+        continue-on-error: true
+        uses: ./
+        with:
+          packages: ${{ runner.temp }}/mistaken
+          signing-key: ${{ steps.keys.outputs.primary }}
+          certificate: ${{ steps.keys.outputs.dir }}/certificate
+
+      - name: Signing with the primary key fails
+        env:
+          OUTCOME: ${{ steps.mistaken.outcome }}
+        run: test "${OUTCOME}" = failure

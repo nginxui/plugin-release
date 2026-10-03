@@ -1,0 +1,10 @@
+{
+  "id": "io.github.example.release-test",
+  "name": "Release test",
+  "version": "1.0.0",
+  "description": "A package the tests of nginxui/plugin-release sign.",
+  "api_version": 1,
+  "webapp": {
+    "bundle_path": "webapp/main.js"
+  }
+}

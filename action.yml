@@ -1,0 +1,120 @@
+name: Sign and release an Nginx UI plugin
+description: Signs the packages of an Nginx UI plugin with its signing key and certificate, checks them and publishes them on the GitHub Release of the tag.
+author: nginxui
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  working-directory:
+    description: The checkout of the plugin repository. cliff.toml and the history for the notes are read there, and packages and certificate are relative to it.
+    required: false
+    default: '.'
+  packages:
+    description: Directory of the unsigned packages, <id>-<version>[-<goos>-<goarch>].tar.gz with plugin.json at the root. They are signed in place.
+    required: false
+    default: dist
+  signing-key:
+    description: The minisign secret key that signs the packages, as its file holds it. Keep it in a secret.
+    required: true
+  signing-key-password:
+    description: Its password, empty for a key made without one.
+    required: false
+    default: ''
+  certificate:
+    description: Directory of the signer certificate, plugin.signer and plugin.signer.minisig from nginx-ui plugin key init. Without one the key signs directly, which suits official and partner keys only.
+    required: false
+    default: '.'
+  trusted-key:
+    description: The public key the catalog and Nginx UI trust for this plugin, the author's primary key that issued the certificate or a key that signs directly such as the official plugin key. When given, the certificate must verify against it, or without a certificate the packages must.
+    required: false
+    default: ''
+  publish:
+    description: Publish the packages on the GitHub Release of the tag, true or false. A version with a prerelease part is published as a prerelease.
+    required: false
+    default: 'false'
+  notes:
+    description: The release notes, git-cliff (needs cliff.toml), generate (by GitHub) or the path of a Markdown file. Empty picks git-cliff when cliff.toml exists, else generate.
+    required: false
+    default: ''
+  token:
+    description: The token that publishes the release.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  packages:
+    description: The signed archives, one per line, relative to working-directory. Each has its .sha256 next to it.
+    value: ${{ steps.sign.outputs.packages }}
+  signer:
+    description: The id of the signing key the certificate names, empty without a certificate.
+    value: ${{ steps.sign.outputs.signer }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install minisign
+      shell: bash
+      run: |
+        if command -v minisign >/dev/null; then
+          exit 0
+        fi
+        case "${RUNNER_OS}" in
+          Linux) sudo apt-get update -qq && sudo apt-get install -y -qq minisign ;;
+          macOS) brew install minisign ;;
+          *) echo "::error::plugin-release runs on Linux or macOS" && exit 1 ;;
+        esac
+
+    - id: sign
+      name: Sign the packages
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PACKAGES_DIR: ${{ inputs.packages }}
+        SIGNING_KEY: ${{ inputs.signing-key }}
+        SIGNING_KEY_PASSWORD: ${{ inputs.signing-key-password }}
+        CERTIFICATE_DIR: ${{ inputs.certificate }}
+        TRUSTED_KEY: ${{ inputs.trusted-key }}
+        TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      run: '"${GITHUB_ACTION_PATH}/sign.sh"'
+
+    - name: Publish the release
+      if: inputs.publish == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        NOTES: ${{ inputs.notes }}
+        PACKAGES: ${{ steps.sign.outputs.packages }}
+      run: |
+        set -euo pipefail
+        if [[ "${GITHUB_REF_TYPE}" != tag ]]; then
+          echo "::error::publish needs a tag, this run is for ${GITHUB_REF}"
+          exit 1
+        fi
+        if [[ -z "${NOTES}" ]]; then
+          NOTES=generate
+          [[ -f cliff.toml ]] && NOTES=git-cliff
+        fi
+        args=(--verify-tag --title "${GITHUB_REF_NAME}")
+        case "${NOTES}" in
+          generate) args+=(--generate-notes) ;;
+          git-cliff)
+            notes="${RUNNER_TEMP}/release-notes.md"
+            npx --yes git-cliff@2.14.2 --current --strip all --output "${notes}"
+            if grep -q '[^[:space:]]' "${notes}"; then
+              args+=(--notes-file "${notes}")
+            else
+              args+=(--generate-notes)
+            fi
+            ;;
+          *) args+=(--notes-file "${NOTES}") ;;
+        esac
+        if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+          args+=(--prerelease)
+        fi
+        assets=()
+        while IFS= read -r archive; do
+          [[ -n "${archive}" ]] && assets+=("${archive}" "${archive}.sha256")
+        done <<<"${PACKAGES}"
+        gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" "${args[@]}" "${assets[@]}"
