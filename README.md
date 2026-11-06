@@ -3,7 +3,7 @@
 A GitHub Action that signs the packages of an Nginx UI plugin and publishes
 them on the GitHub Release of the tag. The plugin's own build makes the
 packages; this action makes them what Nginx UI and the
-[plugin catalog](https://github.com/nginxui/plugins) expect:
+[official catalog](https://nginxui.com/plugin/official-catalog) expect:
 
 1. The signer certificate, `plugin.signer` and `plugin.signer.minisig`, goes
    to the root of every package.
